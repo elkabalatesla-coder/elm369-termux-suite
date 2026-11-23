@@ -1,88 +1,181 @@
 #!/data/data/com.termux/files/usr/bin/bash
-set -e
+set -u
 
-CHECKPOINT_ROOT="${HOME}/termux_checkpoints"
-mkdir -p "${CHECKPOINT_ROOT}"
+CHECKPOINT_DIR="${HOME}/elm369_checkpoints"
+TARGETS=(
+  "gyro_liquid_3d"
+  "qbit_engines_lab"
+  "qbit_audio_lab"
+  "elm369_training_lab"
+  "elm369-termux-suite"
+)
 
-create_save_point() {
-  local tag="${1:-checkpoint}"
-  local stamp
+mkdir -p "${CHECKPOINT_DIR}"
+
+require_hash_tool() {
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "Missing sha256sum. Install coreutils in Termux with: pkg install -y coreutils"
+    return 1
+  fi
+}
+
+list_checkpoints() {
+  echo ""
+  echo "Available checkpoints in ${CHECKPOINT_DIR}:"
+  local found=0
+  for archive in "${CHECKPOINT_DIR}"/*.tar.gz; do
+    [ -e "$archive" ] || continue
+    found=1
+    local base manifest status
+    base="$(basename "$archive")"
+    manifest="${archive}.sha256"
+    if [ -f "$manifest" ]; then
+      if sha256sum -c "$manifest" --status >/dev/null 2>&1; then
+        status="SHA256_OK"
+      else
+        status="SHA256_MISMATCH"
+      fi
+    else
+      status="NO_MANIFEST"
+    fi
+    printf "  - %s [%s]\n" "$base" "$status"
+  done
+  if [ "$found" -eq 0 ]; then
+    echo "  (none)"
+  fi
+}
+
+create_checkpoint() {
+  require_hash_tool || return 1
+  local stamp note safe_note slug archive manifest
   stamp="$(date +%Y%m%d_%H%M%S)"
-  local label="${tag}_${stamp}"
-  local archive="${CHECKPOINT_ROOT}/${label}.tar.gz"
-  local latest_link="${CHECKPOINT_ROOT}/latest.tar.gz"
+  read -r -p "Checkpoint label/note [checkpoint]: " note
+  note="${note:-checkpoint}"
+  safe_note="$(printf '%s' "$note" | tr -cs 'A-Za-z0-9_-' '_' | sed 's/^_//;s/_$//')"
+  slug="${safe_note:-checkpoint}"
 
-  local targets=()
-  for item in \
-    "${HOME}/.bashrc" \
-    "${HOME}/.ctxsw_prompt.sh" \
-    "${HOME}/.ctxsw.sh" \
-    "${HOME}/setup_gyro_liquid.sh" \
-    "${HOME}/fix_termux.sh" \
-    "${HOME}/setup_qbit_engines.sh" \
-    "${HOME}/setup_qbit_audio.sh" \
-    "${HOME}/setup_ai_audio.sh" \
-    "${HOME}/list_termux_env.sh" \
-    "${HOME}/gyro_liquid_3d" \
-    "${HOME}/qbit_engines_lab" \
-    "${HOME}/qbit_audio_lab"
-  do
-    if [ -e "${item}" ]; then
-      targets+=("${item}")
+  archive="${CHECKPOINT_DIR}/elm369_${stamp}_${slug}.tar.gz"
+  manifest="${archive}.sha256"
+
+  local present_targets=()
+  for item in "${TARGETS[@]}"; do
+    if [ -e "${HOME}/${item}" ]; then
+      present_targets+=("$item")
     fi
   done
 
-  if [ "${#targets[@]}" -eq 0 ]; then
-    echo "No target files or directories found to save."
-    exit 1
+  if [ "${#present_targets[@]}" -eq 0 ]; then
+    echo "No target directories found under ${HOME} to archive."
+    return 1
   fi
 
-  tar -czf "${archive}" "${targets[@]}" 2>/dev/null || tar -czf "${archive}" -C "${HOME}" .
-  ln -sf "${archive}" "${latest_link}"
-  echo "SAVED CHECKPOINT: ${archive}"
-  echo "LATEST POINTER:   ${latest_link}"
+  echo "Creating archive: $archive"
+  tar -czf "$archive" -C "${HOME}" "${present_targets[@]}" || return 1
+
+  (
+    cd "${CHECKPOINT_DIR}" && sha256sum "$(basename "$archive")" > "$(basename "$manifest")"
+  ) || return 1
+
+  echo "Wrote SHA-256 manifest: $manifest"
+  echo "Verifying SHA-256 manifest..."
+  (
+    cd "${CHECKPOINT_DIR}" && sha256sum -c "$(basename "$manifest")"
+  ) || {
+    echo "ERROR: Newly created checkpoint failed SHA-256 verification!"
+    return 1
+  }
+  echo "Checkpoint saved and SHA-256 verified."
 }
 
-reclaim_point() {
-  local source_archive="${1:-${CHECKPOINT_ROOT}/latest.tar.gz}"
-  if [ ! -e "${source_archive}" ]; then
-    echo "Checkpoint not found: ${source_archive}"
-    exit 1
+verify_checkpoint_file() {
+  require_hash_tool || return 1
+  local archive="$1"
+  local manifest="${archive}.sha256"
+
+  if [ ! -f "$archive" ]; then
+    echo "Archive not found: $archive"
+    return 1
+  fi
+  if [ ! -f "$manifest" ]; then
+    echo "Manifest not found for archive: $manifest"
+    return 1
   fi
 
-  local resolved_archive
-  resolved_archive="$(readlink -f "${source_archive}")"
-  local safety_backup="${CHECKPOINT_ROOT}/pre_reclaim_$(date +%Y%m%d_%H%M%S).tar.gz"
-  tar -czf "${safety_backup}" -C "${HOME}" \
-    .bashrc \
-    gyro_liquid_3d \
-    qbit_engines_lab \
-    qbit_audio_lab \
-    2>/dev/null || true
-
-  tar -xzf "${resolved_archive}" -C /
-  echo "RECLAIMED FROM:   ${resolved_archive}"
-  echo "SAFETY BACKUP:    ${safety_backup}"
-  echo "Reload shell if needed: source ~/.bashrc"
+  echo "Verifying $(basename "$archive") against $(basename "$manifest")..."
+  (
+    cd "${CHECKPOINT_DIR}" && sha256sum -c "$(basename "$manifest")"
+  )
 }
 
-list_points() {
-  echo "=== SAVED CHECKPOINTS IN ${CHECKPOINT_ROOT} ==="
-  ls -lh "${CHECKPOINT_ROOT}"/*.tar.gz 2>/dev/null || echo "No checkpoints found."
+reclaim_checkpoint() {
+  require_hash_tool || return 1
+  list_checkpoints
+  echo ""
+  read -r -p "Enter checkpoint filename to reclaim (e.g. elm369_20261123_110000_checkpoint.tar.gz): " fname
+  [ -n "$fname" ] || {
+    echo "No filename entered."
+    return 1
+  }
+
+  local archive="${CHECKPOINT_DIR}/${fname}"
+  if ! verify_checkpoint_file "$archive"; then
+    echo "ABORTED: SHA-256 verification failed or manifest missing. Reclaim cancelled."
+    return 1
+  fi
+
+  read -r -p "Overwrite matching workspaces under ${HOME} from $(basename "$archive")? [y/N]: " confirm
+  case "$confirm" in
+    y|Y|yes|YES)
+      tar -xzf "$archive" -C "${HOME}" || return 1
+      echo "Reclaimed workspace from verified checkpoint: $(basename "$archive")"
+      ;;
+    *)
+      echo "Reclaim cancelled."
+      ;;
+  esac
 }
 
-case "${1:-save}" in
-  save)
-    create_save_point "${2:-checkpoint}"
-    ;;
-  reclaim)
-    reclaim_point "${2:-${CHECKPOINT_ROOT}/latest.tar.gz}"
-    ;;
-  list)
-    list_points
-    ;;
-  *)
-    echo "Usage: $0 {save [label] | reclaim [archive.tar.gz] | list}"
-    exit 1
-    ;;
-esac
+verify_menu() {
+  list_checkpoints
+  echo ""
+  read -r -p "Enter checkpoint filename to verify (or 'all' for all manifests): " target
+  [ -n "$target" ] || return 1
+
+  if [ "$target" = "all" ]; then
+    local any=0 rc=0
+    for m in "${CHECKPOINT_DIR}"/*.tar.gz.sha256; do
+      [ -e "$m" ] || continue
+      any=1
+      (
+        cd "${CHECKPOINT_DIR}" && sha256sum -c "$(basename "$m")"
+      ) || rc=1
+    done
+    [ "$any" -eq 1 ] || echo "No .sha256 manifests found in ${CHECKPOINT_DIR}."
+    return "$rc"
+  fi
+
+  verify_checkpoint_file "${CHECKPOINT_DIR}/${target}"
+}
+
+while true; do
+  echo ""
+  echo "=========================================="
+  echo "   ELM369 SAVE / RECLAIM (SHA-256)        "
+  echo "=========================================="
+  echo "  1) Save New Checkpoint + Generate SHA-256"
+  echo "  2) Reclaim Checkpoint (Verify SHA-256 First)"
+  echo "  3) Verify Checkpoint SHA-256 Manifest(s)"
+  echo "  4) List Checkpoints & Hash Status"
+  echo "  0) Exit"
+  echo "=========================================="
+  read -r -p "Select an option [0-4]: " opt
+
+  case "$opt" in
+    1) create_checkpoint ;;
+    2) reclaim_checkpoint ;;
+    3) verify_menu ;;
+    4) list_checkpoints ;;
+    0) break ;;
+    *) echo "Invalid option: $opt" ;;
+  esac
+done
